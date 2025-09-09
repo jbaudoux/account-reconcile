@@ -983,45 +983,58 @@ class AccountBankStatementLine(models.Model):
             ]
         )
         for record in result:
-            res = models._apply_rules(record, record._retrieve_partner())
-            if not res:
-                continue
-            liquidity_lines, suspense_lines, other_lines = record._seek_for_lines()
-            data = []
-            for line in liquidity_lines:
-                reconcile_auxiliary_id, lines = record._get_reconcile_line(
-                    line,
-                    "liquidity",
-                    move=True,
-                )
-                data += lines
-            reconcile_auxiliary_id = 1
-            if res.get("status", "") == "write_off":
-                data = record._recompute_suspense_line(
-                    *record._reconcile_data_by_model(
-                        data, res["model"], reconcile_auxiliary_id
-                    ),
-                    self.manual_reference,
-                )
-            elif res.get("amls"):
-                amount = self.amount_currency or self.amount
-                for line in res.get("amls", []):
-                    reconcile_auxiliary_id, line_datas = record._get_reconcile_line(
-                        line, "other", is_counterpart=True, max_amount=amount, move=True
-                    )
-                    amount -= sum(line_data.get("amount") for line_data in line_datas)
-                    data += line_datas
-                data = record._recompute_suspense_line(
-                    data,
-                    reconcile_auxiliary_id,
-                    self.manual_reference,
-                )
-            if not data.get("can_reconcile"):
-                continue
-            getattr(record, f"_reconcile_bank_line_{record.journal_id.reconcile_mode}")(
-                self._prepare_reconcile_line_data(data["data"])
-            )
+            if not record.is_reconciled:
+                record._enqueue_auto_reconcile(models)
         return result
+
+    def _enqueue_auto_reconcile(self, models):
+        # Install module account_reconcile_oca_queue to run this method in a job queue
+        self._auto_reconcile(models)
+
+    def _auto_reconcile(self, models):
+        self.ensure_one()
+        if self.is_reconciled:
+            # In case the method is run asynchronously, the record could have
+            # been already reconciled
+            return
+        res = models._apply_rules(self, self._retrieve_partner())
+        if not res:
+            return
+        liquidity_lines, suspense_lines, other_lines = self._seek_for_lines()
+        data = []
+        for line in liquidity_lines:
+            reconcile_auxiliary_id, lines = self._get_reconcile_line(
+                line,
+                "liquidity",
+                move=True,
+            )
+            data += lines
+        reconcile_auxiliary_id = 1
+        if res.get("status", "") == "write_off":
+            data = self._recompute_suspense_line(
+                *self._reconcile_data_by_model(
+                    data, res["model"], reconcile_auxiliary_id
+                ),
+                self.manual_reference,
+            )
+        elif res.get("amls"):
+            amount = self.amount_currency or self.amount
+            for line in res.get("amls", []):
+                reconcile_auxiliary_id, line_datas = self._get_reconcile_line(
+                    line, "other", is_counterpart=True, max_amount=amount, move=True
+                )
+                amount -= sum(line_data.get("amount") for line_data in line_datas)
+                data += line_datas
+            data = self._recompute_suspense_line(
+                data,
+                reconcile_auxiliary_id,
+                self.manual_reference,
+            )
+        if not data.get("can_reconcile"):
+            return
+        getattr(self, f"_reconcile_bank_line_{self.journal_id.reconcile_mode}")(
+            self._prepare_reconcile_line_data(data["data"])
+        )
 
     def _synchronize_to_moves(self, changed_fields):
         """We want to avoid to change stuff (mainly amounts ) in accounting entries
